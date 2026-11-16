@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agriculture Information System</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script src="config.js"></script>
+<style>
+ body{background:linear-gradient(180deg,#d9ecd5 0,#f4f7f2 380px) fixed;min-height:100vh} .navbar{background:#2e6b34}
+ .card-stat{border:0;border-left:5px solid #2e6b34;transition:.15s}.card-stat:hover{transform:translateY(-3px);box-shadow:0 .5rem 1rem rgba(0,0,0,.12)!important}.hero{background:linear-gradient(120deg,#2e6b34,#68b077);color:#fff;border-radius:1rem}.ico{font-size:1.9rem}
+ [data-bs-theme=dark] body{background:linear-gradient(180deg,#16301c 0,#111713 380px) fixed}
+ [data-bs-theme=dark] .bg-white{background:#1e2722!important}
+ [data-bs-theme=dark] .text-dark{color:#e9ecef!important}
+ [data-bs-theme=dark] .table-light{--bs-table-bg:#2a352e;--bs-table-color:#e9ecef;--bs-table-border-color:#3a463e}
+ [data-bs-theme=dark] .card{background:#1e2722} .stat{font-size:2rem;font-weight:700}
+ th[data-s]{cursor:pointer;white-space:nowrap} @media print{.navbar,#tb,.no-print{display:none!important}}
+</style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark d-none" id="nav">
+ <div class="container-fluid">
+  <a class="navbar-brand" href="#dashboard">🌾 AgriInSys</a>
+  <button class="navbar-toggler" data-bs-toggle="collapse" data-bs-target="#menu"><span class="navbar-toggler-icon"></span></button>
+  <div class="collapse navbar-collapse" id="menu">
+   <ul class="navbar-nav me-auto" id="links"></ul>
+   <span class="navbar-text me-3" id="who"></span>
+   <button class="btn btn-outline-light btn-sm me-1" id="themeBtn" title="Dark / light mode">🌙</button><button class="btn btn-outline-light btn-sm me-1" id="settings">⚙ Settings</button><button class="btn btn-outline-light btn-sm" id="logout">Log out</button>
+  </div>
+ </div>
+</nav>
+<div class="container py-4">
+ <div id="msg"></div>
+ <div id="app"></div>
+</div>
+<div class="modal fade" id="modal" tabindex="-1"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content">
+ <div class="modal-header"><h5 class="modal-title"></h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+ <div class="modal-body"></div>
+</div></div></div>
+
+<script>
+/* ---------- setup & helpers ---------- */
+const $ = s => document.querySelector(s);
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = n => Number(n || 0).toLocaleString(undefined, {maximumFractionDigits: 2});
+const peso = n => '₱' + Number(n || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const PAGE = 10;
+let sb, user = null, role = 'staff', modal;
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-bs-theme', t);
+  try { localStorage.setItem('theme', t); } catch (e) {}
+  const b = $('#themeBtn'); if (b) b.textContent = t === 'dark' ? '☀' : '🌙';
+}
+const curTheme = () => document.documentElement.getAttribute('data-bs-theme') || 'light';
+
+function flash(type, text) {
+  $('#msg').innerHTML = `<div class="alert alert-${type} alert-dismissible">${esc(text)}<button class="btn-close" data-bs-dismiss="alert"></button></div>`;
+  window.scrollTo(0, 0); setTimeout(() => $('#msg').innerHTML = '', 6000);
+}
+// Friendly error text; never shows connection strings or raw technical details
+function friendly(e) {
+  const c = e?.code, m = e?.message || '';
+  if (c === '23505') return 'That value already exists (duplicate). Please use a different one.';
+  if (c === '23503') return 'This record is linked to other records, so the action is not allowed.';
+  if (c === '23514') return m.includes('Harvest date') ? 'Harvest date cannot be earlier than the planting date.' : 'A value is outside the allowed range.';
+  if (c === '42501') return 'You do not have permission to do that.';
+  return 'Something went wrong. Please try again.';
+}
+
+/* ---------- dropdown (lookup) sources ---------- */
+const OPT = {
+  irrigation: ['ref_irrigation_type', 'irrigation_type_id', r => r.irrigation_type_name],
+  soil:       ['ref_soil_type', 'soil_type_id', r => r.soil_type_name],
+  category:   ['ref_crop_category', 'category_id', r => r.category_name],
+  season:     ['ref_season', 'season_id', r => r.season_name],
+  status:     ['ref_planting_status', 'status_id', r => r.status_name],
+  grade:      ['ref_quality_grade', 'grade_id', r => r.grade_name],
+  remark:     ['ref_harvest_remark', 'remark_id', r => r.remark_description],
+  farmer:     ['farmer', 'farmer_id', r => `${r.last_name}, ${r.first_name}`],
+  farm:       ['farm', 'farm_id', r => r.farm_name],
+  crop:       ['crop', 'crop_id', r => `${r.crop_name} (${r.variety})`],
+};
+async function opts(k) {
+  if (k === 'planting') {
+    const {data} = await sb.from('planting').select('planting_id,planting_date,farm(farm_name),crop(crop_name)').order('planting_id', {ascending: false});
+    return (data || []).map(r => ({v: r.planting_id, l: `#${r.planting_id} ${r.crop?.crop_name} @ ${r.farm?.farm_name}`, d: r.planting_date}));
+  }
+  const [t, id, f] = OPT[k];
+  const {data} = await sb.from(t).select('*').order(id);
+  return (data || []).map(r => ({v: r[id], l: f(r)}));
+}
+// ids of rows in table t whose text columns match the search word (used to search planting/harvest by farm or crop name)
+async function ids(t, pk, cols, q) {
+  const {data} = await sb.from(t).select(pk).or(cols.map(c => `${c}.ilike.%${q}%`).join(',')).limit(500);
+  return (data || []).map(r => r[pk]);
+}
+const inList = (col, a) => a.length ? `${col}.in.(${a.join(',')})` : null;
+
+/* ---------- module definitions (drive the list, search, filter, sort, form) ---------- */
+const M = {
+ farmer: {title: 'Farmers', table: 'farmer', pk: 'farmer_id', sel: '*', search: ['first_name', 'last_name', 'contact_number', 'address'],
+  cols: [['ID', r => r.farmer_id, 'farmer_id'], ['Name', r => `${r.last_name}, ${r.first_name}`, 'last_name'], ['Contact', r => r.contact_number, 'contact_number'], ['Address', r => r.address, 'address'], ['Registered', r => r.date_registered, 'date_registered']],
+  filters: [{n: 'address', l: 'Address contains'}],
+  fields: [{n: 'first_name', l: 'First name', req: 1}, {n: 'last_name', l: 'Last name', req: 1},
+           {n: 'contact_number', l: 'Contact number', req: 1, pat: /^[0-9+() -]{7,20}$/, pm: 'Contact number must be 7–20 characters (digits, +, -, parentheses).'},
+           {n: 'address', l: 'Address', req: 1}, {n: 'date_registered', l: 'Date registered', t: 'date', req: 1, def: 'today'}]},
+ farm: {title: 'Farms', table: 'farm', pk: 'farm_id', sel: '*, farmer(first_name,last_name), ref_soil_type(soil_type_name), ref_irrigation_type(irrigation_type_name)', search: ['farm_name', 'location'],
+  cols: [['ID', r => r.farm_id, 'farm_id'], ['Farm', r => r.farm_name, 'farm_name'], ['Owner', r => `${r.farmer?.last_name}, ${r.farmer?.first_name}`], ['Location', r => r.location, 'location'],
+         ['Area (ha)', r => fmt(r.area_hectares), 'area_hectares'], ['Soil type', r => r.ref_soil_type?.soil_type_name], ['Irrigation', r => r.ref_irrigation_type?.irrigation_type_name]],
+  filters: [{n: 'irrigation_type_id', l: 'Irrigation', o: 'irrigation'}, {n: 'soil_type_id', l: 'Soil type', o: 'soil'}, {n: 'farmer_id', l: 'Owner', o: 'farmer'}],
+  fields: [{n: 'farmer_id', l: 'Owner (farmer)', o: 'farmer', req: 1}, {n: 'farm_name', l: 'Farm name', req: 1}, {n: 'location', l: 'Location', req: 1},
+           {n: 'area_hectares', l: 'Area (hectares)', t: 'number', min: 0.01, max: 100000, req: 1}, {n: 'soil_type_id', l: 'Soil type', o: 'soil', req: 1}, {n: 'irrigation_type_id', l: 'Irrigation type', o: 'irrigation', req: 1}]},
+ crop: {title: 'Crops', table: 'crop', pk: 'crop_id', sel: '*, ref_crop_category(category_name), ref_season(season_name)', search: ['crop_name', 'variety'], adminWrite: 1,
+  cols: [['ID', r => r.crop_id, 'crop_id'], ['Crop', r => r.crop_name, 'crop_name'], ['Variety', r => r.variety, 'variety'], ['Category', r => r.ref_crop_category?.category_name],
+         ['Growing period (days)', r => r.growing_period_days, 'growing_period_days'], ['Recommended season', r => r.ref_season?.season_name]],
+  filters: [{n: 'category_id', l: 'Category', o: 'category'}, {n: 'season_id', l: 'Season', o: 'season'}],
+  fields: [{n: 'crop_name', l: 'Crop name', req: 1}, {n: 'variety', l: 'Variety', req: 1}, {n: 'category_id', l: 'Category', o: 'category', req: 1},
+           {n: 'growing_period_days', l: 'Growing period (days)', t: 'number', min: 1, max: 1500, step: 1, req: 1}, {n: 'season_id', l: 'Recommended season', o: 'season', req: 1}]},
+ planting: {title: 'Planting Records', table: 'planting', pk: 'planting_id', sel: '*, farm(farm_name), crop(crop_name,variety), ref_planting_status(status_name)', search: [],
+  sx: async q => { const [f, c] = await Promise.all([ids('farm', 'farm_id', ['farm_name'], q), ids('crop', 'crop_id', ['crop_name', 'variety'], q)]); return [inList('farm_id', f), inList('crop_id', c)]; },
+  cols: [['ID', r => r.planting_id, 'planting_id'], ['Farm', r => r.farm?.farm_name], ['Crop', r => `${r.crop?.crop_name} (${r.crop?.variety})`], ['Planted', r => r.planting_date, 'planting_date'],
+         ['Expected harvest', r => r.expected_harvest_date, 'expected_harvest_date'], ['Area (ha)', r => fmt(r.area_planted)], ['Seed qty', r => r.seed_quantity == null ? '' : fmt(r.seed_quantity)], ['Status', r => r.ref_planting_status?.status_name]],
+  filters: [{n: 'status_id', l: 'Status', o: 'status'}, {n: 'farm_id', l: 'Farm', o: 'farm'}, {n: 'crop_id', l: 'Crop', o: 'crop'}],
+  fields: [{n: 'farm_id', l: 'Farm', o: 'farm', req: 1}, {n: 'crop_id', l: 'Crop', o: 'crop', req: 1}, {n: 'planting_date', l: 'Planting date', t: 'date', req: 1},
+           {n: 'area_planted', l: 'Area planted (ha)', t: 'number', min: 0.01, max: 100000, req: 1}, {n: 'seed_quantity', l: 'Seed quantity', t: 'number', min: 0, max: 1000000},
+           {n: 'expected_harvest_date', l: 'Expected harvest date', t: 'date', req: 1}, {n: 'status_id', l: 'Status', o: 'status', req: 1}],
+  check: async v => v.expected_harvest_date < v.planting_date ? 'Expected harvest date cannot be earlier than the planting date.' : null},
+ harvest: {title: 'Harvest Records', table: 'harvest', pk: 'harvest_id', sel: '*, planting(planting_date, farm(farm_name), crop(crop_name)), ref_quality_grade(grade_name), ref_harvest_remark(remark_description)', search: [],
+  sx: async q => { const [f, c] = await Promise.all([ids('farm', 'farm_id', ['farm_name'], q), ids('crop', 'crop_id', ['crop_name', 'variety'], q)]);
+    const cond = [inList('farm_id', f), inList('crop_id', c)].filter(Boolean); if (!cond.length) return [];
+    const {data} = await sb.from('planting').select('planting_id').or(cond.join(',')).limit(500); return [inList('planting_id', (data || []).map(r => r.planting_id))]; },
+  cols: [['ID', r => r.harvest_id, 'harvest_id'], ['Farm', r => r.planting?.farm?.farm_name], ['Crop', r => r.planting?.crop?.crop_name], ['Harvest date', r => r.harvest_date, 'harvest_date'],
+         ['Quantity (kg)', r => fmt(r.quantity_kg), 'quantity_kg'], ['Price/kg', r => peso(r.selling_price_per_kg), 'selling_price_per_kg'], ['Grade', r => r.ref_quality_grade?.grade_name], ['Remarks', r => r.ref_harvest_remark?.remark_description]],
+  filters: [{n: 'grade_id', l: 'Quality grade', o: 'grade'}, {n: 'remark_id', l: 'Remarks', o: 'remark'}],
+  fields: [{n: 'planting_id', l: 'Planting record', o: 'planting', req: 1}, {n: 'harvest_date', l: 'Harvest date', t: 'date', req: 1},
+           {n: 'quantity_kg', l: 'Quantity (kg)', t: 'number', min: 0.01, max: 100000000, req: 1}, {n: 'selling_price_per_kg', l: 'Selling price per kg (₱)', t: 'number', min: 0, max: 100000, req: 1},
+           {n: 'grade_id', l: 'Quality grade', o: 'grade', req: 1}, {n: 'remark_id', l: 'Remarks', o: 'remark', req: 1}],
+  check: async v => {
+    const p = (await opts('planting')).find(x => x.v == v.planting_id);
+    return p && v.harvest_date < p.d ? 'Harvest date cannot be earlier than the planting date.' : null;
+  }},
+};
+const canWrite = m => !m.adminWrite || role === 'admin';
+
+/* ---------- list page: search, filter, sort, pagination ---------- */
+async function renderList(k) {
+  const m = M[k]; m.st = m.st || {q: '', page: 0, sort: m.pk, asc: false, f: {}};
+  const fo = await Promise.all(m.filters.map(f => f.o ? opts(f.o) : null));
+  $('#app').innerHTML = `
+   <div class="d-flex justify-content-between align-items-center mb-3"><h3>${m.title}</h3>
+    ${canWrite(m) ? '<button class="btn btn-success" id="add">+ Add new</button>' : '<span class="badge text-bg-secondary">View only (Admin edits)</span>'}</div>
+   <form id="tb" class="row g-2 mb-3">
+    <div class="col-12 col-md-4"><input class="form-control" id="q" placeholder="Search…" value="${esc(m.st.q)}"></div>
+    ${m.filters.map((f, i) => `<div class="col-6 col-md-3">${f.o
+      ? `<select class="form-select" data-f="${f.n}"><option value="">All – ${f.l}</option>${fo[i].map(o => `<option value="${o.v}" ${m.st.f[f.n] == o.v ? 'selected' : ''}>${esc(o.l)}</option>`).join('')}</select>`
+      : `<input class="form-control" data-f="${f.n}" placeholder="${f.l}" value="${esc(m.st.f[f.n] || '')}">`}</div>`).join('')}
+    <div class="col-auto"><button class="btn btn-primary">Search</button> <button type="button" class="btn btn-outline-secondary" id="clr">Clear</button></div>
+   </form><div id="tbl"></div>`;
+  $('#tb').onsubmit = e => { e.preventDefault(); m.st.q = $('#q').value.trim(); m.st.page = 0; m.st.f = {};
+    document.querySelectorAll('[data-f]').forEach(el => { if (el.value.trim()) m.st.f[el.dataset.f] = el.value.trim(); }); loadTable(k); };
+  $('#clr').onclick = () => { m.st = null; renderList(k); };
+  if ($('#add')) $('#add').onclick = () => showForm(k);
+  loadTable(k);
+  if (pendingAdd === k && canWrite(m)) { pendingAdd = null; showForm(k); }
+}
+async function loadTable(k) {
+  const m = M[k], s = m.st;
+  let q = sb.from(m.table).select(m.sel, {count: 'exact'});
+  if (s.q) { const w = s.q.replace(/[,()%*]/g, ' '), parts = m.search.map(c => `${c}.ilike.%${w}%`);
+    if (m.sx) parts.push(...(await m.sx(w)).filter(Boolean));
+    q = parts.length ? q.or(parts.join(',')) : q.eq(m.pk, -1); }
+  m.filters.forEach(f => { if (s.f[f.n]) q = f.o ? q.eq(f.n, s.f[f.n]) : q.ilike(f.n, `%${s.f[f.n].replace(/[,()%*]/g, ' ')}%`); });
+  const {data, count, error} = await q.order(s.sort, {ascending: s.asc}).range(s.page * PAGE, s.page * PAGE + PAGE - 1);
+  if (error) { $('#tbl').innerHTML = ''; return flash('danger', 'Could not load records. Please try again.'); }
+  m.rows = data; const pages = Math.max(1, Math.ceil(count / PAGE));
+  const w = canWrite(m), d = role === 'admin';
+  $('#tbl').innerHTML = `<div class="table-responsive bg-white rounded shadow-sm"><table class="table table-hover align-middle mb-0">
+   <thead class="table-light"><tr>${m.cols.map(c => `<th ${c[2] ? `data-s="${c[2]}"` : ''}>${c[0]}${s.sort === c[2] ? (s.asc ? ' ▲' : ' ▼') : ''}</th>`).join('')}<th>Actions</th></tr></thead>
+   <tbody>${data.length ? data.map(r => `<tr>${m.cols.map(c => `<td>${esc(c[1](r))}</td>`).join('')}<td class="text-nowrap">
+     <button class="btn btn-sm btn-outline-secondary" data-a="view" data-id="${r[m.pk]}">View</button>
+     ${w ? `<button class="btn btn-sm btn-outline-primary" data-a="edit" data-id="${r[m.pk]}">Edit</button>` : ''}
+     ${d ? `<button class="btn btn-sm btn-outline-danger" data-a="del" data-id="${r[m.pk]}">Delete</button>` : ''}</td></tr>`).join('')
+     : `<tr><td colspan="${m.cols.length + 1}" class="text-center text-muted py-4">No records found.</td></tr>`}</tbody></table></div>
+   <div class="d-flex justify-content-between align-items-center mt-3"><small>${count} record(s) — page ${s.page + 1} of ${pages}</small>
+    <div><button class="btn btn-sm btn-outline-dark" id="pv" ${s.page === 0 ? 'disabled' : ''}>« Prev</button>
+    <button class="btn btn-sm btn-outline-dark" id="nx" ${s.page + 1 >= pages ? 'disabled' : ''}>Next »</button></div></div>`;
+  $('#pv').onclick = () => { s.page--; loadTable(k); }; $('#nx').onclick = () => { s.page++; loadTable(k); };
+  document.querySelectorAll('th[data-s]').forEach(th => th.onclick = () => { s.asc = s.sort === th.dataset.s ? !s.asc : true; s.sort = th.dataset.s; loadTable(k); });
+  document.querySelectorAll('[data-a]').forEach(b => b.onclick = () => {
+    const row = m.rows.find(r => r[m.pk] == b.dataset.id);
+    b.dataset.a === 'view' ? showView(k, row) : b.dataset.a === 'edit' ? showForm(k, row) : del(k, row);
+  });
+}
+function openModal(title, html) { $('#modal .modal-title').textContent = title; $('#modal .modal-body').innerHTML = html; modal.show(); }
+async function showView(k, r) {
+  const m = M[k], ids = [r.created_by, r.updated_by].filter(Boolean);
+  const {data: pf} = ids.length ? await sb.from('profiles').select('id,full_name').in('id', ids) : {data: []};
+  const who = id => id ? ' by ' + esc((pf || []).find(p => p.id === id)?.full_name || 'unknown user') : '';
+  openModal(m.title.replace(/s$/, '') + ' details', `<dl class="row mb-0">${m.cols.map(c => `<dt class="col-5">${c[0]}</dt><dd class="col-7">${esc(c[1](r)) || '—'}</dd>`).join('')}
+   ${r.notes ? `<dt class="col-5">Notes</dt><dd class="col-7">${esc(r.notes)}</dd>` : ''}
+   <dt class="col-5">Created</dt><dd class="col-7">${new Date(r.created_at).toLocaleString()}${who(r.created_by)}</dd><dt class="col-5">Last updated</dt><dd class="col-7">${r.updated_by ? new Date(r.updated_at).toLocaleString() + who(r.updated_by) : 'Not edited yet'}</dd></dl>`);
+}
+
+/* ---------- add / edit form with validation ---------- */
+async function showForm(k, row) {
+  const m = M[k];
+  const inputs = await Promise.all(m.fields.map(async f => {
+    const id = 'f_' + f.n, val = row?.[f.n] ?? (f.def === 'today' ? new Date().toISOString().slice(0, 10) : '');
+    let el;
+    if (f.o) el = `<select class="form-select" id="${id}"><option value="">-- Select --</option>${(await opts(f.o)).map(o => `<option value="${o.v}" ${val == o.v ? 'selected' : ''}>${esc(o.l)}</option>`).join('')}</select>`;
+    else if (f.t === 'textarea') el = `<textarea class="form-control" id="${id}" rows="3" maxlength="500">${esc(val)}</textarea>`;
+    else el = `<input class="form-control" id="${id}" type="${f.t || 'text'}" value="${esc(val)}" ${f.t === 'number' ? `step="${f.step || 'any'}" min="${f.min ?? ''}" max="${f.max ?? ''}"` : 'maxlength="150"'}>`;
+    return `<div class="mb-3"><label class="form-label" for="${id}">${f.l}${f.req ? ' <span class="text-danger">*</span>' : ''}</label>${el}</div>`;
+  }));
+  openModal((row ? 'Edit ' : 'Add ') + m.title.replace(/s$/, ''), `<div id="ferr"></div><form id="frm" novalidate>${inputs.join('')}
+    <div class="text-end"><button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button> <button class="btn btn-success">Save</button></div></form>`);
+  $('#frm').onsubmit = async e => {
+    e.preventDefault();
+    const v = {}, errs = [];
+    m.fields.forEach(f => {
+      const raw = $('#f_' + f.n).value.trim();
+      v[f.n] = raw === '' ? null : (f.t === 'number' || f.o) ? Number(raw) : raw;
+      const x = v[f.n];
+      if (f.req && x === null) return errs.push(`${f.l} is required.`);
+      if (x === null) return;
+      if (f.t === 'number') { if (isNaN(x)) errs.push(`${f.l} must be a valid number.`);
+        else { if (f.min != null && x < f.min) errs.push(`${f.l} must be at least ${f.min}.`); if (f.max != null && x > f.max) errs.push(`${f.l} must not exceed ${f.max}.`); } }
+      if (f.t === 'date' && isNaN(Date.parse(x))) errs.push(`${f.l} must be a valid date.`);
+      if (f.pat && !f.pat.test(x)) errs.push(f.pm);
+    });
+    if (!errs.length && m.check) { const c = await m.check(v); if (c) errs.push(c); }
+    if (errs.length) { $('#ferr').innerHTML = `<div class="alert alert-danger"><ul class="mb-0">${errs.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>`; return; }
+    const {error} = row ? await sb.from(m.table).update(v).eq(m.pk, row[m.pk]) : await sb.from(m.table).insert(v);
+    if (error) { $('#ferr').innerHTML = `<div class="alert alert-danger">${esc(friendly(error))}</div>`; return; }
+    modal.hide(); flash('success', row ? 'Record updated successfully.' : 'Record added successfully.'); loadTable(k);
+  };
+}
+async function del(k, row) {
+  const m = M[k];
+  if (!confirm('Permanently delete this record? This cannot be undone.')) return;
+  const {data, error} = await sb.from(m.table).delete().eq(m.pk, row[m.pk]).select();
+  if (error) return flash('danger', error.code === '23503' ? 'Cannot delete: this record is used by other records (for example, a farm that has plantings). Remove the related records first.' : friendly(error));
+  if (!data.length) return flash('danger', 'You do not have permission to delete records.');
+  flash('success', 'Record deleted successfully.'); loadTable(k);
+}
+
+/* ---------- dashboard (all values come from the database) ---------- */
+let pendingAdd = null;
+function quickAdd(k) { pendingAdd = k; location.hash === '#' + k ? renderList(k) : (location.hash = '#' + k); }
+const bars = (pairs, unit = '') => { const mx = Math.max(1, ...pairs.map(p => p[1]));
+  return pairs.length ? pairs.map(([n, v]) => `<div class="d-flex align-items-center mb-2 small"><div class="text-truncate" style="width:32%">${esc(n)}</div>
+    <div class="progress flex-grow-1 mx-2" style="height:14px"><div class="progress-bar bg-success" style="width:${v / mx * 100}%"></div></div>
+    <div class="text-end" style="min-width:80px">${fmt(v)}${unit}</div></div>`).join('') : '<span class="text-muted">No data yet.</span>'; };
+async function dash() {
+  $('#app').innerHTML = '<div class="text-center py-5"><div class="spinner-border text-success"></div></div>';
+  const cnt = async t => (await sb.from(t).select('*', {count: 'exact', head: true})).count ?? 0;
+  const keys = ['farmer', 'farm', 'crop', 'planting', 'harvest'], labels = ['Farmers', 'Farms', 'Crops', 'Planting records', 'Harvest records'], icons = ['👨‍🌾', '🏡', '🌾', '🌱', '🧺'];
+  const [counts, rp, rh, st, hv] = await Promise.all([
+    Promise.all(keys.map(cnt)),
+    sb.from('planting').select('planting_id,planting_date,farm(farm_name),crop(crop_name),ref_planting_status(status_name)').order('planting_date', {ascending: false}).limit(5),
+    sb.from('harvest').select('harvest_id,harvest_date,quantity_kg,planting(farm(farm_name),crop(crop_name))').order('harvest_date', {ascending: false}).limit(5),
+    sb.from('planting').select('ref_planting_status(status_name)'),
+    sb.from('harvest').select('quantity_kg,harvest_date,selling_price_per_kg,planting(crop(crop_name))')]);
+  const H = hv.data || [], num2 = r => Number(r.quantity_kg);
+  const total = H.reduce((a, r) => a + num2(r), 0), value = H.reduce((a, r) => a + num2(r) * Number(r.selling_price_per_kg || 0), 0);
+  const byStatus = tally(st.data || [], r => r.ref_planting_status?.status_name, () => 1);
+  const byCrop = tally(H, r => r.planting?.crop?.crop_name, num2).sort((a, b) => b[1] - a[1]);
+  const byMonth = tally(H, r => r.harvest_date.slice(0, 7), num2).sort((a, b) => a[0].localeCompare(b[0])).slice(-6);
+  const tbl = (h, rows) => `<div class="table-responsive"><table class="table table-sm mb-0"><thead><tr>${h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${h.length}" class="text-muted">No data yet.</td></tr>`}</tbody></table></div>`;
+  const card = (t, body) => `<div class="card shadow-sm border-0 h-100"><div class="card-body"><h6 class="mb-3">${t}</h6>${body}</div></div>`;
+  $('#app').innerHTML = `
+   <div class="hero p-4 mb-4 shadow-sm"><h3 class="mb-1">Welcome, ${esc(user.email)}</h3>
+    <div class="mb-3 opacity-75">${role === 'admin' ? 'Administrator access: add, edit and delete records, manage Crops and user roles.' : 'Staff access: add and edit records. Deleting records and managing Crops need an Administrator.'}</div>
+    <button class="btn btn-light btn-sm me-1" onclick="quickAdd('farmer')">+ Farmer</button><button class="btn btn-light btn-sm me-1" onclick="quickAdd('farm')">+ Farm</button>
+    <button class="btn btn-light btn-sm me-1" onclick="quickAdd('planting')">+ Planting</button><button class="btn btn-light btn-sm" onclick="quickAdd('harvest')">+ Harvest</button></div>
+   <div class="row g-3 mb-3">${keys.map((k, i) => `<div class="col-6 col-md-4 col-lg"><a href="#${k}" class="text-decoration-none text-dark"><div class="card card-stat shadow-sm"><div class="card-body d-flex justify-content-between align-items-center"><div><div class="text-muted small">${labels[i]}</div><div class="stat">${counts[i]}</div></div><div class="ico">${icons[i]}</div></div></div></a></div>`).join('')}</div>
+   <div class="row g-3 mb-3">
+    <div class="col-md-6 col-lg-3"><div class="card card-stat shadow-sm"><div class="card-body"><div class="text-muted small">Total harvested</div><div class="stat">${fmt(total)} kg</div></div></div></div>
+    <div class="col-md-6 col-lg-3"><div class="card card-stat shadow-sm"><div class="card-body"><div class="text-muted small">Estimated harvest value</div><div class="stat">${peso(value)}</div></div></div></div>
+    <div class="col-lg-6">${card('Plantings by status', bars(byStatus))}</div></div>
+   <div class="row g-3 mb-3"><div class="col-lg-6">${card('Harvested quantity by crop (kg)', bars(byCrop))}</div><div class="col-lg-6">${card('Harvest per month – last 6 months (kg)', bars(byMonth))}</div></div>
+   <div class="row g-3"><div class="col-lg-6">${card('Recent planting records', tbl(['Date', 'Farm', 'Crop', 'Status'], (rp.data || []).map(r => [r.planting_date, r.farm?.farm_name, r.crop?.crop_name, r.ref_planting_status?.status_name])))}</div>
+    <div class="col-lg-6">${card('Recent harvest records', tbl(['Date', 'Farm', 'Crop', 'Kg'], (rh.data || []).map(r => [r.harvest_date, r.planting?.farm?.farm_name, r.planting?.crop?.crop_name, fmt(r.quantity_kg)])))}</div></div>`;
+}
+
+/* ---------- users and access (Administrator only) ---------- */
+async function users() {
+  if (role !== 'admin') { location.hash = '#dashboard'; return; }
+  const {data} = await sb.from('profiles').select('*').order('created_at');
+  $('#app').innerHTML = `<h3 class="mb-3">Users and access</h3><div class="table-responsive bg-white rounded shadow-sm"><table class="table align-middle mb-0">
+   <thead class="table-light"><tr><th>User</th><th>Role</th><th>Created</th></tr></thead><tbody>${(data || []).map(p => `<tr><td>${esc(p.full_name)}${p.id === user.id ? ' <span class="badge text-bg-secondary">you</span>' : ''}</td>
+   <td><select class="form-select form-select-sm w-auto" data-u="${p.id}" ${p.id === user.id ? 'disabled' : ''}><option value="staff" ${p.role === 'staff' ? 'selected' : ''}>Staff</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Administrator</option></select></td>
+   <td>${new Date(p.created_at).toLocaleDateString()}</td></tr>`).join('')}</tbody></table></div>
+   <p class="text-muted small mt-2">Staff: add and edit records. Administrator: also delete records, manage Crops and Users.</p>`;
+  document.querySelectorAll('[data-u]').forEach(sel => sel.onchange = async () => {
+    const {data: d, error} = await sb.from('profiles').update({role: sel.value}).eq('id', sel.dataset.u).select();
+    (error || !d.length) ? flash('danger', 'Role not changed. Run the "admin updates profiles" SQL policy first.') : flash('success', 'Role updated.'); });
+}
+
+/* ---------- reports (date-range filter, results from the database) ---------- */
+const rng = (q, col, f, t) => { if (f) q = q.gte(col, f); if (t) q = q.lte(col, t); return q; };
+const tally = (rows, kf, vf) => { const o = {}; rows.forEach(r => { const k = kf(r); o[k] = (o[k] || 0) + vf(r); }); return Object.entries(o); };
+const HV = 'quantity_kg,harvest_date,selling_price_per_kg,ref_harvest_remark(remark_description),planting(farm(farm_name),crop(crop_name))';
+const R = {
+ farmers: {t: 'Farmers and their farms', dated: 0, h: ['Farmer', 'Address', 'Farm', 'Location', 'Area (ha)', 'Irrigation'],
+  q: () => sb.from('farmer').select('last_name,first_name,address,farm(farm_name,location,area_hectares,ref_irrigation_type(irrigation_type_name))').order('last_name'),
+  run: d => [d.flatMap(f => (f.farm.length ? f.farm : [null]).map(x => [`${f.last_name}, ${f.first_name}`, f.address, x?.farm_name ?? '—', x?.location ?? '—', x ? fmt(x.area_hectares) : '—', x?.ref_irrigation_type?.irrigation_type_name ?? '—']))]},
+ cropsfarm: {t: 'Crops planted per farm', dated: 1, h: ['Farm', 'Crop', 'No. of plantings', 'Total area (ha)'],
+  q: (f, t) => rng(sb.from('planting').select('area_planted,farm(farm_name),crop(crop_name)'), 'planting_date', f, t),
+  run: d => { const o = {}; d.forEach(r => { const k = `${r.farm?.farm_name}|${r.crop?.crop_name}`; o[k] = o[k] || [0, 0]; o[k][0]++; o[k][1] += Number(r.area_planted); });
+    return [Object.entries(o).sort().map(([k, v]) => [...k.split('|'), v[0], fmt(v[1])])]; }},
+ status: {t: 'Planting records by status', dated: 1, h: ['Status', 'No. of planting records'],
+  q: (f, t) => rng(sb.from('planting').select('ref_planting_status(status_name)'), 'planting_date', f, t),
+  run: d => [tally(d, r => r.ref_planting_status?.status_name, () => 1)]},
+ harvest: {t: 'Harvest records (with estimated value)', dated: 1, h: ['Date', 'Farm', 'Crop', 'Quantity (kg)', 'Remark', 'Est. value'],
+  q: (f, t) => rng(sb.from('harvest').select(HV).order('harvest_date'), 'harvest_date', f, t),
+  run: d => [d.map(r => [r.harvest_date, r.planting?.farm?.farm_name, r.planting?.crop?.crop_name, fmt(r.quantity_kg), r.ref_harvest_remark?.remark_description, peso(r.quantity_kg * r.selling_price_per_kg)]),
+    ['TOTAL', '', '', fmt(d.reduce((a, r) => a + Number(r.quantity_kg), 0)), '', peso(d.reduce((a, r) => a + r.quantity_kg * r.selling_price_per_kg, 0))]]},
+ totals: {t: 'Total harvested quantity & estimated value by crop', dated: 1, h: ['Crop', 'Total quantity (kg)', 'Estimated value'],
+  q: (f, t) => rng(sb.from('harvest').select(HV), 'harvest_date', f, t),
+  run: d => { const q = tally(d, r => r.planting?.crop?.crop_name, r => Number(r.quantity_kg)), v = tally(d, r => r.planting?.crop?.crop_name, r => r.quantity_kg * r.selling_price_per_kg);
+    return [q.map(([c, n], i) => [c, fmt(n), peso(v[i][1])]), ['TOTAL', fmt(q.reduce((a, x) => a + x[1], 0)), peso(v.reduce((a, x) => a + x[1], 0))]]; }},
+};
+function reports() {
+  $('#app').innerHTML = `<h3 class="mb-3">Reports</h3><form id="rf" class="row g-2 mb-3 no-print">
+   <div class="col-12 col-md-4"><select class="form-select" id="rk">${Object.entries(R).map(([k, r]) => `<option value="${k}">${r.t}</option>`).join('')}</select></div>
+   <div class="col-6 col-md-2"><input type="date" class="form-control" id="rfrom" title="From date"></div><div class="col-6 col-md-2"><input type="date" class="form-control" id="rto" title="To date"></div>
+   <div class="col-auto"><button class="btn btn-primary">Generate</button> <button type="button" class="btn btn-outline-secondary" onclick="window.print()">Print</button></div></form><div id="rout"></div>`;
+  $('#rf').onsubmit = async e => {
+    e.preventDefault(); const r = R[$('#rk').value], f = $('#rfrom').value, t = $('#rto').value;
+    if (f && t && f > t) return flash('danger', 'The "From" date cannot be later than the "To" date.');
+    const {data, error} = await r.q(f, t); if (error) return flash('danger', 'Could not generate the report. Please try again.');
+    const [rows, foot] = r.run(data);
+    $('#rout').innerHTML = `<h5>${r.t}</h5><p class="text-muted small">${r.dated && (f || t) ? `Period: ${f || 'start'} to ${t || 'today'}` : 'All records'}</p><div class="table-responsive bg-white rounded shadow-sm"><table class="table table-striped mb-0">
+     <thead class="table-light"><tr>${r.h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.map(x => `<tr>${x.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${r.h.length}" class="text-center text-muted py-3">No data for this report.</td></tr>`}</tbody>
+     ${foot && rows.length ? `<tfoot><tr class="fw-bold">${foot.map(c => `<td>${esc(c)}</td>`).join('')}</tr></tfoot>` : ''}</table></div>`;
+  };
+  $('#rf').requestSubmit();
+}
+
+/* ---------- settings window ---------- */
+function showSettings() {
+  openModal('Settings', `<h6>Account</h6><dl class="row"><dt class="col-4">Email</dt><dd class="col-8">${esc(user.email)}</dd><dt class="col-4">Role</dt><dd class="col-8">${role === 'admin' ? 'Administrator' : 'Staff'}</dd></dl>
+   <h6>Appearance</h6><div class="form-check form-switch mb-3"><input class="form-check-input" type="checkbox" id="darkSw" ${curTheme() === 'dark' ? 'checked' : ''}><label class="form-check-label" for="darkSw">Dark mode</label></div>
+   <h6>Change password</h6><div id="pwerr"></div><form id="pwf" novalidate><input type="password" class="form-control mb-2" id="np1" placeholder="New password (min. 6 characters)" autocomplete="new-password">
+   <input type="password" class="form-control mb-2" id="np2" placeholder="Confirm new password" autocomplete="new-password"><button class="btn btn-success">Update password</button></form>`);
+  $('#darkSw').onchange = e => applyTheme(e.target.checked ? 'dark' : 'light');
+  const err = t => $('#pwerr').innerHTML = `<div class="alert alert-danger py-2">${esc(t)}</div>`;
+  $('#pwf').onsubmit = async e => { e.preventDefault(); const a = $('#np1').value, b = $('#np2').value;
+    if (a.length < 6) return err('Password must be at least 6 characters.'); if (a !== b) return err('The two passwords do not match.');
+    const {error} = await sb.auth.updateUser({password: a}); error ? err(error.message) : (modal.hide(), flash('success', 'Password updated.')); };
+}
+
+/* ---------- login, roles, routing ---------- */
+function showLogin() {
+  $('#nav').classList.add('d-none');
+  $('#app').innerHTML = `<div class="row justify-content-center"><div class="col-md-5"><div class="card shadow"><div class="card-body p-4">
+   <h3 class="text-center mb-1">🌾 AgriInSys </h3><p class="text-center text-muted">Please log in</p>
+   <form id="lf" novalidate><div class="mb-3"><label class="form-label">Email</label><input type="email" class="form-control" id="em" autocomplete="username"></div>
+   <div class="mb-3"><label class="form-label">Password (min. 6 characters)</label><input type="password" class="form-control" id="pw" autocomplete="current-password"></div>
+   <button class="btn btn-success w-100 mb-2">Log in</button><button type="button" class="btn btn-outline-secondary w-100" id="su">Create staff account</button></form></div></div></div></div>`;
+  const creds = () => { const e = $('#em').value.trim(), p = $('#pw').value;
+    if (!/^\S+@\S+\.\S+$/.test(e)) { flash('danger', 'Please enter a valid email address.'); return null; }
+    if (p.length < 6) { flash('danger', 'Password must be at least 6 characters.'); return null; } return {email: e, password: p}; };
+  $('#lf').onsubmit = async e => { e.preventDefault(); const c = creds(); if (!c) return;
+    const {data, error} = await sb.auth.signInWithPassword(c);
+    error ? flash('danger', 'Incorrect email or password (or the email is not yet confirmed).') : enter(data.user); };
+  $('#su').onclick = async () => { const c = creds(); if (!c) return;
+    const {error} = await sb.auth.signUp(c);
+    if (error) console.error('Sign-up error:', error);
+    error ? flash('danger', 'Could not create the account: ' + error.message) : flash('success', 'Account created. If email confirmation is enabled, check your inbox, then log in.'); };
+}
+async function enter(u) {
+  user = u;
+  const {data} = await sb.from('profiles').select('role').eq('id', u.id).single(); role = data?.role || 'staff';
+  const pages = [['dashboard', 'Dashboard'], ['farmer', 'Farmers'], ['farm', 'Farms'], ['crop', 'Crops'], ['planting', 'Planting'], ['harvest', 'Harvest'], ['reports', 'Reports']];
+  if (role === 'admin') pages.push(['users', 'Users']);
+  $('#links').innerHTML = pages.map(p => `<li class="nav-item"><a class="nav-link" data-p="${p[0]}" href="#${p[0]}">${p[1]}</a></li>`).join('');
+  $('#who').textContent = `${u.email} (${role})`; $('#nav').classList.remove('d-none'); route();
+}
+function route() {
+  if (!user) return; const k = (location.hash || '#dashboard').slice(1);
+  document.querySelectorAll('[data-p]').forEach(a => a.classList.toggle('active', a.dataset.p === k));
+  k === 'reports' ? reports() : k === 'users' ? users() : M[k] ? renderList(k) : dash();
+}
+(async function init() {
+  if (typeof SUPABASE_URL === 'undefined' || SUPABASE_URL.includes('YOUR-')) {
+    $('#app').innerHTML = '<div class="alert alert-warning">Setup needed: open <b>config.js</b> and paste your Supabase URL and anon key.</div>'; return; }
+  sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY); modal = new bootstrap.Modal($('#modal'));
+  window.addEventListener('hashchange', route);
+  let saved = 'light'; try { saved = localStorage.getItem('theme') || 'light'; } catch (e) {}
+  applyTheme(saved);
+  $('#themeBtn').onclick = () => applyTheme(curTheme() === 'dark' ? 'light' : 'dark');
+  $('#settings').onclick = showSettings;
+  $('#logout').onclick = async () => { await sb.auth.signOut(); user = null; location.hash = ''; showLogin(); };
+  const {data: {session}} = await sb.auth.getSession(); session ? enter(session.user) : showLogin();
+})();
+</script>
+</body>
+</html>
